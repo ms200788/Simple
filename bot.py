@@ -361,39 +361,31 @@ def append_draft_links(user_id: int, urls: list[str]) -> tuple[int, int]:
 # Help and commands
 # ---------------------------------------------------------------------
 
-HELP_TEXT = """🤖 Telegram + Render + Colab
+HELP_TEXT = """🤖 Telegram + Colab File Manager
 
-Only the owner and registered admins can use this bot.
+Render only manages commands, jobs and heartbeat. Colab does all file work.
 
-GENERAL
-/start — Show help.
-/help — Show all commands.
-/status — Render, Colab and queue status.
-/connect — Explain/check Colab heartbeat.
-/disconnect — Mark Colab offline.
-/jobs — Show your recent jobs.
-/cancel JOB_ID — Request job cancellation.
+WORKFLOW
+/send — Start a normal file upload batch.
+/convert FORMAT — Convert files you send to FORMAT (e.g. /convert mp4).
+Reply to a thumbnail photo with /singlethumbnail or /batchthumbnail "Series - Episode {ep}" [START_EP], then send files.
+/done — Finish and queue the current batch. /batchdone is an alias.
+/batchcancel — Discard the current batch.
 
-GOOGLE DRIVE
-/drive URL [URL ...] — Queue Google Drive links.
-/download URL [URL ...] — Queue direct HTTP(S) links.
-/convert FORMAT URL [URL ...] — Queue conversion.
+MANAGEMENT
+/status — Render, Colab and job status.
+/jobs — Recent jobs.
+/cancel JOB_ID — Cancel a job.
+/connect — Colab heartbeat status.
+/help — Show this help.
 
-THUMBNAILS
-/batchthumbnail "Series - Episode {ep}" [START_EP]
-/singlethumbnail "Custom filename"
-Send Drive link(s), then send one photo, then /batchdone.
-/batchdone — Submit the thumbnail job.
-/batchcancel — Discard the draft.
+OWNER ONLY
+/addadmin USER_ID | /removeadmin USER_ID | /admins
 
-ADMIN (OWNER ONLY)
-/addadmin USER_ID
-/removeadmin USER_ID
-/admins
-
-The Render bot stays online and stores jobs in PostgreSQL.
-Colab performs downloads, conversions and Telegram uploads when connected.
-Jobs remain queued while Colab is offline.
+Send files as Telegram documents or videos. Up to 50 files per batch.
+Colab downloads from the private intake channel, converts when requested,
+adds thumbnails, and uploads to the destination channel with filename captions.
+Keep the Colab notebook running. Render stores only small job records and status.
 """
 
 
@@ -403,8 +395,9 @@ def command_parts(text: str) -> tuple[str, str]:
     return command, parts[1].strip() if len(parts) > 1 else ""
 
 
-def handle_command(user_id: int, chat_id: int, message_id: int, text: str) -> None:
+def handle_command(user_id: int, chat_id: int, message_id: int, text: str, message: dict[str, Any] | None = None) -> None:
     command, args = command_parts(text)
+    message = message or {}
 
     if command in ("/start", "/help"):
         safe_send(chat_id, HELP_TEXT, message_id)
@@ -542,108 +535,69 @@ def handle_command(user_id: int, chat_id: int, message_id: int, text: str) -> No
                 safe_send(chat_id, f"🗑 Admin removed: {target_id}", message_id)
         return
 
-    if command == "/batchthumbnail":
-        if not args:
-            safe_send(chat_id, 'Usage: /batchthumbnail "Series - Episode {ep}" [START_EP]', message_id)
+    if command in ("/send", "/convert", "/singlethumbnail", "/batchthumbnail"):
+        mode, template, start_ep = "send", "", 1
+        if command == "/convert":
+            fmt = args.lower().lstrip(".")
+            if not re.fullmatch(r"[a-z0-9]{2,8}", fmt):
+                safe_send(chat_id, "Usage: /convert FORMAT (example: /convert mp4). Then send files and /done.", message_id)
+                return
+            mode, template = "convert", fmt
+        elif command == "/singlethumbnail":
+            mode = "single_thumbnail"
+            template = args.strip().strip('"') or "{name}"
+            reply = message.get("reply_to_message") or {}
+            if not reply.get("photo"):
+                safe_send(chat_id, "Reply directly to a thumbnail PHOTO with /singlethumbnail [optional filename template].", message_id)
+                return
+            try:
+                thumb_id = forward_thumbnail_to_intake(chat_id, int(reply["message_id"]))
+            except Exception as exc:
+                safe_send(chat_id, f"Could not forward thumbnail to intake: {str(exc)[:250]}", message_id)
+                return
+            set_draft(user_id, mode, template, 1)
+            with SessionLocal() as db:
+                draft = db.get(Draft, user_id); draft.thumbnail_message_id = str(thumb_id); db.commit()
+            safe_send(chat_id, "🖼 Thumbnail set. Now send files (up to 50), then /done.", message_id)
             return
-        match = re.match(r'^"(.+?)"(?:\s+(\d+))?$', args)
-        if match:
-            template = match.group(1).strip()
-            start_ep = int(match.group(2) or 1)
-        else:
-            parts = args.rsplit(maxsplit=1)
-            if len(parts) == 2 and parts[1].isdigit():
-                template, start_ep = parts[0].strip().strip('"'), int(parts[1])
+        elif command == "/batchthumbnail":
+            mode = "batch_thumbnail"
+            match = re.match(r'^"(.+?)"(?:\s+(\d+))?$', args)
+            if match:
+                template, start_ep = match.group(1).strip(), int(match.group(2) or 1)
             else:
-                template, start_ep = args.strip().strip('"'), 1
-        if "{ep}" not in template:
-            safe_send(chat_id, "Batch template must contain {ep}, e.g. Series - Episode {ep}.", message_id)
+                parts = args.rsplit(maxsplit=1)
+                if len(parts) == 2 and parts[1].isdigit(): template, start_ep = parts[0].strip().strip('"'), int(parts[1])
+                else: template, start_ep = args.strip().strip('"'), 1
+            if "{ep}" not in template:
+                safe_send(chat_id, 'Usage: reply to a photo with /batchthumbnail "Series - Episode {ep}" [START_EP].', message_id)
+                return
+            reply = message.get("reply_to_message") or {}
+            if not reply.get("photo"):
+                safe_send(chat_id, "Reply directly to a thumbnail PHOTO with the /batchthumbnail command.", message_id)
+                return
+            try:
+                thumb_id = forward_thumbnail_to_intake(chat_id, int(reply["message_id"]))
+            except Exception as exc:
+                safe_send(chat_id, f"Could not forward thumbnail to intake: {str(exc)[:250]}", message_id)
+                return
+            set_draft(user_id, mode, template, start_ep)
+            with SessionLocal() as db:
+                draft = db.get(Draft, user_id); draft.thumbnail_message_id = str(thumb_id); db.commit()
+            safe_send(chat_id, f"🧩 Batch thumbnail set. Template: {template}. Send up to 50 files, then /done.", message_id)
             return
-        if start_ep < 0:
-            safe_send(chat_id, "START_EP must be zero or greater.", message_id)
+        else:
+            set_draft(user_id, mode, template, start_ep)
+            safe_send(chat_id, "📥 Batch started. Send up to 50 Telegram files/videos, then /done.", message_id)
             return
-        set_draft(user_id, "batch_thumbnail", template, start_ep)
-        safe_send(
-            chat_id,
-            f"🧩 Batch draft started.\nTemplate: {template}\nStart episode: {start_ep}\n"
-            f"Send up to {MAX_BATCH_LINKS} Drive links, then one photo, then /batchdone.",
-            message_id,
-        )
-        return
-
-    if command == "/singlethumbnail":
-        if not args:
-            safe_send(chat_id, 'Usage: /singlethumbnail "Custom filename"', message_id)
-            return
-        template = args.strip().strip('"')
-        if not template:
-            safe_send(chat_id, "Please provide a filename template.", message_id)
-            return
-        set_draft(user_id, "single_thumbnail", template, 1)
-        safe_send(chat_id, "🖼 Single thumbnail draft started. Send exactly one Drive link, then one photo, then /batchdone.", message_id)
-        return
 
     if command == "/batchcancel":
         removed = cancel_draft(user_id)
         safe_send(chat_id, "Draft discarded." if removed else "No active draft.", message_id)
         return
 
-    if command == "/batchdone":
+    if command in ("/batchdone", "/done"):
         submit_thumbnail_draft(user_id, chat_id, message_id)
-        return
-
-    if command in ("/drive", "/download"):
-        if not args:
-            safe_send(chat_id, f"Usage: {command} URL [URL ...]", message_id)
-            return
-        try:
-            urls = extract_urls(args)
-        except ValueError as exc:
-            safe_send(chat_id, str(exc), message_id)
-            return
-        if not urls:
-            safe_send(chat_id, "No valid links found.", message_id)
-            return
-        if len(urls) > MAX_BATCH_LINKS:
-            safe_send(chat_id, f"Maximum {MAX_BATCH_LINKS} links per job.", message_id)
-            return
-        if command == "/drive" and not all(is_google_drive_url(url) for url in urls):
-            safe_send(chat_id, "Use Google Drive links with /drive. Use /download for direct links.", message_id)
-            return
-        job_id = create_job(
-            user_id,
-            "drive_download" if command == "/drive" else "direct_download",
-            {"urls": urls, "caption_mode": "filename"},
-        )
-        safe_send(chat_id, f"📥 Job queued: {job_id}\nFiles: {len(urls)}\nColab will process it when connected.", message_id)
-        return
-
-    if command == "/convert":
-        parts = args.split()
-        if len(parts) < 2:
-            safe_send(chat_id, "Usage: /convert FORMAT URL [URL ...]", message_id)
-            return
-        output_format = parts[0].lower().lstrip(".")
-        if not re.fullmatch(r"[a-z0-9]{2,8}", output_format):
-            safe_send(chat_id, "Invalid output format.", message_id)
-            return
-        try:
-            urls = extract_urls(" ".join(parts[1:]))
-        except ValueError as exc:
-            safe_send(chat_id, str(exc), message_id)
-            return
-        if not urls:
-            safe_send(chat_id, "No valid links found.", message_id)
-            return
-        if len(urls) > MAX_BATCH_LINKS:
-            safe_send(chat_id, f"Maximum {MAX_BATCH_LINKS} links per job.", message_id)
-            return
-        job_id = create_job(
-            user_id,
-            "convert",
-            {"urls": urls, "format": output_format, "caption_mode": "filename"},
-        )
-        safe_send(chat_id, f"🎞 Conversion job queued: {job_id}\nFiles: {len(urls)}\nColab will process it when connected.", message_id)
         return
 
     safe_send(chat_id, "Unknown command. Use /help.", message_id)
@@ -653,125 +607,54 @@ def submit_thumbnail_draft(user_id: int, chat_id: int, message_id: int) -> None:
     with SessionLocal() as db:
         draft = db.get(Draft, user_id)
         if not draft:
-            safe_send(chat_id, "No active thumbnail draft.", message_id)
-            return
-        links = json.loads(draft.links_json or "[]")
-        if not links:
-            safe_send(chat_id, "Add at least one Google Drive link first.", message_id)
-            return
-        if draft.mode == "single_thumbnail" and len(links) != 1:
-            safe_send(chat_id, "Single thumbnail mode accepts exactly one Drive link.", message_id)
-            return
-        if not draft.thumbnail_message_id:
-            safe_send(chat_id, "Send a valid thumbnail photo before /batchdone.", message_id)
-            return
-        if not INTAKE_CHANNEL_ID:
-            safe_send(chat_id, "INTAKE_CHANNEL_ID is missing in Render.", message_id)
-            return
-
+            safe_send(chat_id, "No active batch. Start with /send, /convert, or a thumbnail command.", message_id); return
+        message_ids = json.loads(draft.links_json or "[]")
+        if not message_ids:
+            safe_send(chat_id, "Send at least one Telegram file/video first.", message_id); return
+        if len(message_ids) > MAX_BATCH_LINKS:
+            safe_send(chat_id, f"Maximum {MAX_BATCH_LINKS} files per batch.", message_id); return
+        if draft.mode in ("single_thumbnail", "batch_thumbnail") and not draft.thumbnail_message_id:
+            safe_send(chat_id, "Thumbnail is missing. Cancel and start again by replying to a thumbnail photo.", message_id); return
         payload = {
-            "urls": links,
+            "message_ids": [int(x) for x in message_ids],
+            "intake_channel_id": INTAKE_CHANNEL_ID,
             "template": draft.template,
             "start_ep": draft.start_ep,
-            "thumbnail": {
-                "intake_channel_id": INTAKE_CHANNEL_ID,
-                "message_id": int(draft.thumbnail_message_id),
-            },
-            "caption_mode": "filename",
-            "max_parallel_files": MAX_PARALLEL_JOBS,
+            "thumbnail_message_id": int(draft.thumbnail_message_id) if draft.thumbnail_message_id else None,
+            "format": draft.template if draft.mode == "convert" else None,
         }
         job_type = draft.mode
-        job_id = uuid.uuid4().hex[:16]
-        now = utcnow()
-        db.add(Job(
-            id=job_id,
-            owner_id=user_id,
-            job_type=job_type,
-            status="queued",
-            payload_json=json.dumps(payload, ensure_ascii=False),
-            progress=0,
-            message="Waiting for Colab worker",
-            created_at=now,
-            updated_at=now,
-        ))
-        db.delete(draft)
-        db.commit()
-
-    safe_send(
-        chat_id,
-        f"✅ {job_type.replace('_', ' ').title()} queued.\nJob: {job_id}\n"
-        f"Files: {len(links)}\nTemplate: {payload['template']}\n"
-        "Colab will apply the shared thumbnail when connected.",
-        message_id,
-    )
+        job_id = uuid.uuid4().hex[:16]; now = utcnow()
+        db.add(Job(id=job_id, owner_id=user_id, job_type=job_type, status="queued",
+                   payload_json=json.dumps(payload, ensure_ascii=False), progress=0,
+                   message="Waiting for Colab", created_at=now, updated_at=now))
+        db.delete(draft); db.commit()
+    safe_send(chat_id, f"✅ Batch queued: {job_id}\nFiles: {len(message_ids)}\nColab will download, process and upload everything.", message_id)
 
 
 def handle_non_command_message(user_id: int, chat_id: int, message: dict[str, Any]) -> None:
     message_id = int(message["message_id"])
-    text = message.get("text") or message.get("caption") or ""
-    urls = extract_urls(text) if text else []
-
     with SessionLocal() as db:
         draft = db.get(Draft, user_id)
         if not draft:
             return
-
-        if urls:
-            if not all(is_google_drive_url(url) for url in urls):
-                safe_send(chat_id, "Thumbnail drafts accept Google Drive links only.", message_id)
-                return
-            current = json.loads(draft.links_json or "[]")
-            if draft.mode == "single_thumbnail" and current:
-                safe_send(chat_id, "Single thumbnail mode accepts exactly one Drive link.", message_id)
-                return
-            if len(current) + len(urls) > MAX_BATCH_LINKS:
-                safe_send(chat_id, f"That exceeds the {MAX_BATCH_LINKS}-file limit.", message_id)
-                return
-            added = 0
-            for url in urls:
-                if url not in current:
-                    current.append(url)
-                    added += 1
-            draft.links_json = json.dumps(current)
-            db.commit()
-            safe_send(chat_id, f"📎 Added {added} new link(s). Draft total: {len(current)}.", message_id)
+        media = any(message.get(k) for k in ("document", "video", "audio", "animation", "video_note"))
+        if not media:
+            if message.get("photo"):
+                safe_send(chat_id, "To use this as a thumbnail, reply to this photo with /singlethumbnail or /batchthumbnail.", message_id)
             return
-
-        photos = message.get("photo")
-        if photos:
-            # Telegram photo messages contain multiple sizes. The largest variant
-            # is forwarded; Colab retrieves it from the intake channel using Telethon.
-            largest = photos[-1]
-            file_size = int(largest.get("file_size", 0) or 0)
-            width = int(largest.get("width", 0) or 0)
-            height = int(largest.get("height", 0) or 0)
-            if width < 100 or height < 100:
-                safe_send(chat_id, "❌ Thumbnail is too small. Send a clear image at least 100×100 pixels.", message_id)
-                return
-            if file_size and file_size > 19 * 1024 * 1024:
-                safe_send(chat_id, "❌ Thumbnail photo is too large. Send it as a compressed Telegram photo, not a document.", message_id)
-                return
-            if not INTAKE_CHANNEL_ID:
-                safe_send(chat_id, "INTAKE_CHANNEL_ID is not configured in Render.", message_id)
-                return
-            try:
-                forwarded_id = forward_thumbnail_to_intake(chat_id, message_id)
-                draft.thumbnail_message_id = str(forwarded_id)
-                db.commit()
-                safe_send(chat_id, "🖼 Thumbnail received and forwarded to intake. Send /batchdone when ready.", message_id)
-            except Exception as exc:
-                log.exception("Thumbnail forwarding failed")
-                safe_send(
-                    chat_id,
-                    "❌ Could not forward the thumbnail. Check that the bot is an administrator "
-                    "in the private intake channel and can post messages.\n"
-                    f"Telegram error: {str(exc)[:350]}",
-                    message_id,
-                )
-            return
-
-        if message.get("document"):
-            safe_send(chat_id, "Please send the thumbnail as a Telegram photo, not as a document/file.", message_id)
+        current = json.loads(draft.links_json or "[]")
+        if len(current) >= MAX_BATCH_LINKS:
+            safe_send(chat_id, f"Batch is full ({MAX_BATCH_LINKS} files). Send /done.", message_id); return
+        try:
+            forwarded_id = forward_thumbnail_to_intake(chat_id, message_id)
+        except Exception as exc:
+            log.exception("File forwarding failed")
+            safe_send(chat_id, f"Could not forward file to intake channel: {str(exc)[:250]}", message_id); return
+        current.append(str(forwarded_id))
+        draft.links_json = json.dumps(current)
+        db.commit()
+    safe_send(chat_id, f"📎 File received ({len(current)}/{MAX_BATCH_LINKS}). Send more files or /done.", message_id)
 
 
 # ---------------------------------------------------------------------
@@ -803,7 +686,7 @@ def telegram_webhook():
             return jsonify({"ok": True})
         text = message.get("text") or ""
         if text.startswith("/"):
-            handle_command(int(user_id), int(chat_id), int(message_id), text)
+            handle_command(int(user_id), int(chat_id), int(message_id), text, message)
         else:
             handle_non_command_message(int(user_id), int(chat_id), message)
     except Exception:
@@ -1096,6 +979,23 @@ def webhook_setup():
         return auth
     configure_webhook_once()
     return jsonify({"ok": WEBHOOK_CONFIGURED}), (200 if WEBHOOK_CONFIGURED else 503)
+
+
+# Best-effort Render self-health requests. Colab heartbeat traffic is the primary
+# keep-awake signal while the notebook is running; this thread cannot override
+# Render's free-instance sleep policy on its own.
+def render_self_ping_loop() -> None:
+    while True:
+        try:
+            requests.get(f"{RENDER_PUBLIC_URL}/health", timeout=20)
+        except Exception:
+            log.exception("Render self-ping failed")
+        time.sleep(9 * 60)
+
+try:
+    threading.Thread(target=render_self_ping_loop, name="render-self-ping", daemon=True).start()
+except Exception:
+    log.exception("Could not start Render self-ping thread")
 
 
 # Initial startup is deliberately non-fatal if Telegram or PostgreSQL is
