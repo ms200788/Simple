@@ -115,7 +115,13 @@ def env_required(name: str) -> str:
 BOT_TOKEN = env_required("BOT_TOKEN")
 OWNER_USER_ID = int(env_required("OWNER_USER_ID"))
 WEBHOOK_SECRET = env_required("TELEGRAM_WEBHOOK_SECRET")
-RENDER_PUBLIC_URL = env_required("RENDER_PUBLIC_URL").rstrip("/")
+RENDER_PUBLIC_URL = (
+    os.getenv("RENDER_PUBLIC_URL")
+    or os.getenv("RENDER_EXTERNAL_URL", "")
+).strip().rstrip("/")
+
+if not RENDER_PUBLIC_URL:
+    raise RuntimeError("Missing Render public URL")
 WORKER_API_TOKEN = env_required("WORKER_API_TOKEN")
 
 INTAKE_CHANNEL_ID = os.getenv("INTAKE_CHANNEL_ID", "").strip()
